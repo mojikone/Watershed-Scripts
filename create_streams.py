@@ -716,39 +716,31 @@ class CreateStreamsAlgorithm(QgsProcessingAlgorithm):
 
     def postProcessAlgorithm(self, context, feedback):
         from qgis.core import (QgsProcessingUtils, QgsProject,
-                               QgsSymbol, QgsLineSymbol,
-                               QgsRuleBasedRenderer, QgsWkbTypes)
-        from qgis.PyQt.QtGui import QColor
+                               QgsGraduatedSymbolRenderer, QgsRendererRange,
+                               QgsLineSymbol)
 
         lyr = QgsProcessingUtils.mapLayerFromString(self._dest_id, context)
         if not lyr:
             return {}
 
-        # Strahler order rules: (label, filter, hex_color, width_mm)
-        _RULES = [
-            ("Order 1",  '"STRM_VAL" = 1',   "#9ecae1", 0.26),
-            ("Order 2",  '"STRM_VAL" = 2',   "#6baed6", 0.46),
-            ("Order 3",  '"STRM_VAL" = 3',   "#3182bd", 0.76),
-            ("Order 4",  '"STRM_VAL" = 4',   "#08689c", 1.20),
-            ("Order 5",  '"STRM_VAL" = 5',   "#084594", 1.80),
-            ("Order 6",  '"STRM_VAL" = 6',   "#022864", 2.50),
-            ("Order 7+", '"STRM_VAL" >= 7',  "#00143c", 3.50),
+        _RANGES = [
+            ("1 - 2", 1.0, 2.0, 0.15),
+            ("2 - 3", 2.0, 3.0, 0.28),
+            ("3 - 4", 3.0, 4.0, 0.41),
+            ("4 - 5", 4.0, 5.0, 0.54),
+            ("5 - 6", 5.0, 6.0, 0.67),
+            ("6 - 7", 6.0, 7.0, 0.80),
         ]
-
-        root = QgsRuleBasedRenderer.Rule(None)
-        for label, filt, color, width in _RULES:
+        ranges = []
+        for label, lo, hi, w in _RANGES:
             sym = QgsLineSymbol.createSimple({
-                "color": color,
-                "line_width": str(width),
-                "capstyle": "round",
-                "joinstyle": "round",
+                "color": "0,55,240,255",
+                "line_width": str(w),
+                "capstyle": "square",
+                "joinstyle": "bevel",
             })
-            rule = QgsRuleBasedRenderer.Rule(sym)
-            rule.setLabel(label)
-            rule.setFilterExpression(filt)
-            root.appendChild(rule)
-
-        lyr.setRenderer(QgsRuleBasedRenderer(root))
+            ranges.append(QgsRendererRange(lo, hi, sym, label))
+        lyr.setRenderer(QgsGraduatedSymbolRenderer("STRM_VAL", ranges))
 
         tree_lyr = QgsProject.instance().layerTreeRoot().findLayer(lyr.id())
         if tree_lyr:
