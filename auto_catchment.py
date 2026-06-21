@@ -25,6 +25,7 @@ import os, sys, math, time, glob, csv, concurrent.futures
 from qgis.core import (
     QgsProcessingParameterEnum,
     QgsProcessingParameterString,
+    QgsProcessingParameterBoolean,
     QgsProcessingAlgorithm,
     QgsProcessingParameterPoint,
     QgsProcessingParameterRasterLayer,
@@ -420,19 +421,275 @@ def _delineate(wbt, dem_path, coords, snap_dist, threshold_km2, epsg, temp_dir, 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# MERIT-Hydro / delineator helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _apply_merit_patches():
+    """Patch delineator.queries for the SpatiaLite format used by mghydro.com.
+
+    gpd.read_file(sql=...) silently ignores WHERE clauses for SpatiaLite files;
+    the 'comid' column is treated as OGR FID and dropped from the result.
+    Fix: use layer= + where= for filtering; identify the downstream reach by
+    max uparea instead of comid column lookup.
+    """
+    import sqlite3 as _sl3
+    import geopandas as _gpd
+    import delineator.queries as _dq
+    import delineator.core as _dc
+
+    def _get_upstream_area_patched(home_unit_catchment, config):
+        if len(str(home_unit_catchment)) < 7:
+            return 0
+        megabasin = str(home_unit_catchment)[0:2]
+        from delineator.data import _find_data_file
+        rivers_db_path = _find_data_file(f"vector/rivers{megabasin}.db", config)
+        conn = _sl3.connect(rivers_db_path)
+        cur = conn.cursor()
+        cur.execute(f"SELECT uparea FROM rivers WHERE comid = {home_unit_catchment}")
+        row = cur.fetchone()
+        conn.close()
+        return row[0] if row else 0
+
+    def _get_rivers_patched(upstream_catchment_list, split_catchment_polygon, config):
+        home_unit_catchment = upstream_catchment_list[0]
+        if len(str(home_unit_catchment)) < 6:
+            return None
+        megabasin = str(home_unit_catchment)[0:2]
+        from delineator.data import _find_data_file
+        rivers_db_path = _find_data_file(f"vector/rivers{megabasin}.db", config)
+
+        id_list = ", ".join(str(i) for i in upstream_catchment_list)
+        if len(upstream_catchment_list) == 1:
+            where_clause = f"comid = {home_unit_catchment}"
+        else:
+            conn = _sl3.connect(rivers_db_path)
+            cur = conn.cursor()
+            cur.execute(f"SELECT sorder FROM rivers WHERE comid = {home_unit_catchment}")
+            row = cur.fetchone()
+            conn.close()
+            if row is None:
+                return None
+            where_clause = (f"comid IN ({id_list}) AND "
+                            f"sorder > {row[0] - config.num_stream_orders}")
+
+        rivers_gdf = _gpd.read_file(rivers_db_path, layer="rivers", where=where_clause)
+        if len(rivers_gdf) == 0:
+            return None
+
+        if split_catchment_polygon is not None:
+            ds_idx = rivers_gdf["uparea"].idxmax()
+            split_reach = rivers_gdf.loc[ds_idx, "geometry"].intersection(split_catchment_polygon)
+            rivers_gdf.loc[ds_idx, "geometry"] = split_reach
+
+        return rivers_gdf
+
+    _dq.get_upstream_area = _get_upstream_area_patched
+    _dq.get_rivers = _get_rivers_patched
+    _dc.get_upstream_area = _get_upstream_area_patched
+    _dc.get_rivers = _get_rivers_patched
+
+
+def _merit_parallel_download(url, dest_path, total_bytes, supports_range, known_hash, feedback):
+    """Download url to dest_path using parallel Range requests when server allows it."""
+    import hashlib, threading, time
+    from pathlib import Path
+    requests = _ensure_requests(feedback)
+    dest = Path(dest_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    n_threads = min(4, os.cpu_count() or 2) if (supports_range and total_bytes > 10 * 1024 * 1024) else 1
+
+    if n_threads == 1 or not supports_range:
+        r = requests.get(url, stream=True, timeout=300)
+        r.raise_for_status()
+        downloaded = 0
+        t0 = time.time()
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=65536):
+                if feedback.isCanceled():
+                    dest.unlink(missing_ok=True)
+                    raise QgsProcessingException("Download cancelled.")
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total_bytes > 0 and downloaded % (10 * 1024 * 1024) < 65536:
+                    pct = int(downloaded / total_bytes * 100)
+                    elapsed = time.time() - t0
+                    speed = downloaded / elapsed / 1e6 if elapsed > 0 else 0
+                    feedback.pushInfo(f"    {pct}%  {downloaded/1e6:.0f}/{total_bytes/1e6:.0f} MB"
+                                      f"  @ {speed:.1f} MB/s")
+    else:
+        with open(dest, "wb") as f:
+            f.seek(total_bytes - 1)
+            f.write(b"\0")
+
+        progress = {"downloaded": 0}
+        lock = threading.Lock()
+        chunk_size_each = total_bytes // n_threads
+        ranges = [(i * chunk_size_each,
+                   (i * chunk_size_each + chunk_size_each - 1) if i < n_threads - 1 else total_bytes - 1)
+                  for i in range(n_threads)]
+
+        def _fetch_chunk(start, end):
+            r = requests.get(url, headers={"Range": f"bytes={start}-{end}"}, timeout=300, stream=True)
+            r.raise_for_status()
+            with open(dest, "r+b") as f:
+                f.seek(start)
+                for data in r.iter_content(chunk_size=65536):
+                    f.write(data)
+                    with lock:
+                        progress["downloaded"] += len(data)
+
+        t0 = time.time()
+        feedback.pushInfo(f"    Parallel download: {n_threads} threads")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as ex:
+            futs = [ex.submit(_fetch_chunk, s, e) for s, e in ranges]
+            while not all(f.done() for f in futs):
+                if feedback.isCanceled():
+                    for f in futs:
+                        f.cancel()
+                    dest.unlink(missing_ok=True)
+                    raise QgsProcessingException("Download cancelled.")
+                done = progress["downloaded"]
+                pct = int(done / total_bytes * 100) if total_bytes else 0
+                elapsed = time.time() - t0
+                speed = done / elapsed / 1e6 if elapsed > 0 else 0
+                feedback.pushInfo(f"    {pct}%  {done/1e6:.0f}/{total_bytes/1e6:.0f} MB  @ {speed:.1f} MB/s")
+                feedback.setProgress(pct)
+                time.sleep(2.0)
+            for f in futs:
+                if f.exception():
+                    dest.unlink(missing_ok=True)
+                    raise QgsProcessingException(f"Download error: {f.exception()}")
+
+        elapsed = time.time() - t0
+        feedback.pushInfo(f"    Done: {total_bytes/1e6:.0f} MB in {elapsed:.0f}s"
+                          f"  @ {total_bytes/elapsed/1e6:.1f} MB/s avg")
+
+    if known_hash:
+        feedback.pushInfo("    Verifying SHA256 ...")
+        import hashlib
+        sha = hashlib.sha256()
+        with open(dest, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                sha.update(chunk)
+        if sha.hexdigest() != known_hash:
+            dest.unlink(missing_ok=True)
+            raise QgsProcessingException(
+                f"Hash mismatch for {dest.name} — file deleted. Re-run to re-download.")
+        feedback.pushInfo("    Hash OK")
+
+
+def _delineate_merit(lat, lng, include_rivers, data_dir, feedback):
+    """Delineate watershed via MERIT-Hydro pre-computed data (delineator library)."""
+    from pathlib import Path
+
+    if WBT_SITE not in sys.path:
+        sys.path.insert(0, WBT_SITE)
+    try:
+        import delineator  # noqa: F401
+    except ImportError:
+        feedback.pushInfo("Installing delineator package (runs once) ...")
+        _pip_install("delineator", feedback)
+        import importlib
+        importlib.invalidate_caches()
+
+    _apply_merit_patches()
+
+    import sqlite3 as _sl3
+    from delineator.constants import MEGABASINS_DB_FILE, HASHES, USE_SPATIALITE
+    from delineator.spatial import _point_in_polygon_analysis
+    from delineator import DelineatorConfig, delineate
+    from shapely.geometry import Point
+
+    data_path = Path(data_dir)
+
+    # Determine megabasin from bundled megabasins.db (no download needed)
+    conn = _sl3.connect(MEGABASINS_DB_FILE)
+    megabasin = _point_in_polygon_analysis(
+        conn, Point(lng, lat), table="megabasins", geom_col="geometry",
+        id_col="basin", use_spatialite=USE_SPATIALITE, search_dist=0.1)
+    conn.close()
+
+    if megabasin is None:
+        raise QgsProcessingException(
+            f"Point ({lat:.5f}, {lng:.5f}) is not within any MERIT megabasin. "
+            "Check that the point is over land.")
+
+    feedback.pushInfo(f"  Megabasin   : {megabasin}")
+
+    files_needed = [
+        f"vector/basins{megabasin}.db",
+        f"raster/flowdir{megabasin}.tif",
+        f"raster/accum{megabasin}.tif",
+    ]
+    if include_rivers:
+        files_needed.append(f"vector/rivers{megabasin}.db")
+
+    requests = _ensure_requests(feedback)
+    for rel_path in files_needed:
+        dest = data_path / rel_path
+        url = f"https://mghydro.com/watersheds/{rel_path.replace(os.sep, '/')}"
+
+        if dest.exists() and dest.stat().st_size > 10_000:
+            feedback.pushInfo(f"  Cached      : {rel_path}  ({dest.stat().st_size/1e6:.0f} MB)")
+            continue
+
+        try:
+            head = requests.head(url, timeout=15, allow_redirects=True)
+            head.raise_for_status()
+            total_bytes = int(head.headers.get("Content-Length", 0))
+            supports_range = head.headers.get("Accept-Ranges", "").lower() == "bytes"
+        except Exception as e:
+            raise QgsProcessingException(
+                f"Cannot reach mghydro.com to check {rel_path}:\n{e}\n"
+                "Check your internet connection.")
+
+        feedback.pushInfo(f"  Download    : {rel_path}  ({total_bytes/1e6:.0f} MB)")
+        if feedback.isCanceled():
+            raise QgsProcessingException("Cancelled by user.")
+
+        _merit_parallel_download(url, dest, total_bytes, supports_range,
+                                 HASHES.get(rel_path), feedback)
+
+    feedback.pushInfo("  Delineating watershed ...")
+    cfg = DelineatorConfig(
+        data_dir=data_path,
+        high_res=True,
+        rivers=include_rivers,
+        auto_download=False,
+    )
+    watershed_gdf, rivers_gdf, outlet_gdf = delineate(lat=lat, lng=lng, config=cfg)
+
+    if watershed_gdf is None:
+        raise QgsProcessingException(
+            "MERIT-Hydro delineation returned no watershed. "
+            "The point may be in a coastal catchment or within a data gap.")
+
+    return watershed_gdf, rivers_gdf, outlet_gdf
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 class AutoCatchmentAlgorithm(QgsProcessingAlgorithm):
 
-    CLICK_POINT   = "CLICK_POINT"
-    INPUT_DEM     = "INPUT_DEM"
-    SOURCE        = "SOURCE"
-    OT_API_KEY    = "OT_API_KEY"
-    SNAP_DISTANCE = "SNAP_DISTANCE"
-    THRESHOLD_KM2 = "THRESHOLD_KM2"
-    TARGET_CRS    = "TARGET_CRS"
-    MAX_TILES     = "MAX_TILES"
-    OUTPUT        = "OUTPUT"
-    OUTPUT_OUTLET = "OUTPUT_OUTLET"
-    OUTPUT_DEM    = "OUTPUT_DEM"
+    METHOD         = "METHOD"
+    CLICK_POINT    = "CLICK_POINT"
+    INPUT_DEM      = "INPUT_DEM"
+    SOURCE         = "SOURCE"
+    OT_API_KEY     = "OT_API_KEY"
+    SNAP_DISTANCE  = "SNAP_DISTANCE"
+    THRESHOLD_KM2  = "THRESHOLD_KM2"
+    TARGET_CRS     = "TARGET_CRS"
+    MAX_TILES      = "MAX_TILES"
+    INCLUDE_RIVERS = "INCLUDE_RIVERS"
+    OUTPUT         = "OUTPUT"
+    OUTPUT_OUTLET  = "OUTPUT_OUTLET"
+    OUTPUT_DEM     = "OUTPUT_DEM"
+    OUTPUT_RIVERS  = "OUTPUT_RIVERS"
+
+    METHODS = [
+        "WhiteboxTools  (DEM-based · auto-delineation)",
+        "MERIT-Hydro / delineator  (pre-computed · no DEM needed)",
+    ]
 
     EPS_DEG = 0.002   # ~200 m — boundary-touch tolerance in degrees
 
@@ -482,6 +739,11 @@ class AutoCatchmentAlgorithm(QgsProcessingAlgorithm):
         )
 
     def initAlgorithm(self, config=None):
+        self.addParameter(QgsProcessingParameterEnum(
+            self.METHOD,
+            self.tr("Delineation method"),
+            options=self.METHODS,
+            defaultValue=0))
         self.addParameter(QgsProcessingParameterPoint(
             self.CLICK_POINT, self.tr("Pour point  (click on map canvas)")))
         self.addParameter(QgsProcessingParameterRasterLayer(
@@ -510,6 +772,10 @@ class AutoCatchmentAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterNumber(
             self.MAX_TILES, self.tr("Max tiles / expansions (safety cap)"),
             type=QgsProcessingParameterNumber.Integer, defaultValue=16, minValue=1))
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.INCLUDE_RIVERS,
+            self.tr("Include river network  (MERIT method only)"),
+            defaultValue=False, optional=True))
         self.addParameter(QgsProcessingParameterVectorDestination(
             self.OUTPUT, self.tr("Output catchment polygons"),
             type=QgsProcessing.TypeVectorPolygon))
@@ -519,9 +785,16 @@ class AutoCatchmentAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterRasterDestination(
             self.OUTPUT_DEM, self.tr("Output downloaded DEM  (download mode only)"),
             optional=True, createByDefault=False))
+        self.addParameter(QgsProcessingParameterVectorDestination(
+            self.OUTPUT_RIVERS, self.tr("Output river network  (MERIT method only)"),
+            type=QgsProcessing.TypeVectorLine, optional=True, createByDefault=False))
 
     # ── main ───────────────────────────────────────────────────────────────────
     def processAlgorithm(self, parameters, context, feedback):
+        method = self.parameterAsEnum(parameters, self.METHOD, context)
+        if method == 1:
+            return self._run_merit(parameters, context, feedback)
+
         snap_dist     = self.parameterAsDouble(parameters, self.SNAP_DISTANCE, context)
         threshold_km2 = self.parameterAsDouble(parameters, self.THRESHOLD_KM2, context)
         max_tiles     = self.parameterAsInt(parameters, self.MAX_TILES, context)
@@ -685,6 +958,79 @@ class AutoCatchmentAlgorithm(QgsProcessingAlgorithm):
             result[self.OUTPUT_OUTLET] = out_outlet_id
         if download_mode and out_dem_path:
             result[self.OUTPUT_DEM] = out_dem_path
+        return result
+
+    # ── MERIT-Hydro delineation ─────────────────────────────────────────────────
+    def _run_merit(self, parameters, context, feedback):
+        import tempfile
+        from pathlib import Path
+
+        wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+        pt_wgs = self.parameterAsPoint(parameters, self.CLICK_POINT, context, wgs84)
+        lon, lat = pt_wgs.x(), pt_wgs.y()
+        include_rivers = self.parameterAsBool(parameters, self.INCLUDE_RIVERS, context)
+
+        data_dir = os.path.join(os.environ.get("TEMP", tempfile.gettempdir()), "merit_data")
+
+        feedback.pushInfo("─" * 60)
+        feedback.pushInfo("  Method      : MERIT-Hydro / delineator")
+        feedback.pushInfo(f"  Click WGS84 : lon {lon:.5f}, lat {lat:.5f}")
+        feedback.pushInfo(f"  Rivers      : {'Yes' if include_rivers else 'No'}")
+        feedback.pushInfo(f"  Cache dir   : {data_dir}")
+        feedback.pushInfo("─" * 60)
+
+        t0 = time.time()
+        watershed_gdf, rivers_gdf, outlet_gdf = _delineate_merit(
+            lat=lat, lng=lon, include_rivers=include_rivers,
+            data_dir=data_dir, feedback=feedback)
+
+        # Write to temp GPKG then sink into QGIS output
+        tmp_gpkg = os.path.join(tempfile.gettempdir(), "merit_result.gpkg")
+        for _f in (tmp_gpkg,):
+            if os.path.exists(_f):
+                try:
+                    os.remove(_f)
+                except Exception:
+                    pass
+
+        watershed_gdf.to_file(tmp_gpkg, driver="GPKG", layer="watershed")
+        poly_layer = QgsVectorLayer(f"{tmp_gpkg}|layername=watershed", "merit_ws", "ogr")
+        poly_layer.setCrs(wgs84)
+
+        (sink, dest_id) = self.parameterAsSink(
+            parameters, self.OUTPUT, context,
+            poly_layer.fields(), QgsWkbTypes.MultiPolygon, wgs84)
+
+        for feat in poly_layer.getFeatures():
+            if feedback.isCanceled():
+                break
+            sink.addFeature(feat, QgsFeatureSink.FastInsert)
+
+        result = {self.OUTPUT: dest_id}
+
+        # Rivers output (optional)
+        if (include_rivers and rivers_gdf is not None
+                and parameters.get(self.OUTPUT_RIVERS)):
+            rivers_gdf.to_file(tmp_gpkg, driver="GPKG", layer="rivers", mode="a")
+            rivers_layer = QgsVectorLayer(
+                f"{tmp_gpkg}|layername=rivers", "merit_rivers", "ogr")
+            rivers_layer.setCrs(wgs84)
+            (rsink, rivers_dest_id) = self.parameterAsSink(
+                parameters, self.OUTPUT_RIVERS, context,
+                rivers_layer.fields(), QgsWkbTypes.MultiLineString, wgs84)
+            for feat in rivers_layer.getFeatures():
+                rsink.addFeature(feat, QgsFeatureSink.FastInsert)
+            result[self.OUTPUT_RIVERS] = rivers_dest_id
+
+        area_km2 = float(watershed_gdf["area_km2"].iloc[0]) \
+            if "area_km2" in watershed_gdf.columns else 0.0
+
+        feedback.setProgress(100)
+        feedback.pushInfo("─" * 60)
+        feedback.pushInfo(f"  Area        : {area_km2:.1f} km²")
+        feedback.pushInfo(f"  CRS         : EPSG:4326")
+        feedback.pushInfo(f"  Total time  : {time.time() - t0:.1f}s")
+        feedback.pushInfo("─" * 60)
         return result
 
     # ── boundary-touch test → expanded coverage or None ────────────────────────
