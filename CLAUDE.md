@@ -110,3 +110,9 @@ refactor, or improve.
    - **Commit hygiene.** When committing on my behalf, one logical change 
      per commit, so a regression can be reverted without losing unrelated 
      good work.
+
+10. **Never push to a remote repository without explicit confirmation.** 
+    Before any `git push`, state exactly what will be pushed (branch, 
+    commit summary) and wait for a clear go-ahead. "Go" on a coding task 
+    is not authorization to push. Authorization must be explicit: 
+    "push it", "yes push", or similar direct instruction.
