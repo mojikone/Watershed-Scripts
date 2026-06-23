@@ -337,7 +337,7 @@ def _init_wbt(feedback):
     return wbt
 
 
-def _delineate(wbt, dem_path, coords, snap_dist, threshold_km2, epsg, temp_dir, feedback, force_reprocess=False):
+def _delineate(wbt, dem_path, coords, snap_dist, threshold_km2, epsg, temp_dir, feedback):
     """Full WhiteboxTools watershed pipeline (mirrors delineate_catchments.py).
     Returns (watershed_vector_shp, snapped_outlets_shp). Stream rasters are always rebuilt."""
     from osgeo import gdal
@@ -705,7 +705,6 @@ class AutoCatchmentAlgorithm(QgsProcessingAlgorithm):
     TARGET_CRS     = "TARGET_CRS"
     MAX_TILES      = "MAX_TILES"
     INCLUDE_RIVERS  = "INCLUDE_RIVERS"
-    FORCE_REPROCESS = "FORCE_REPROCESS"
     USE_CACHED_DEM  = "USE_CACHED_DEM"
     OUTPUT         = "OUTPUT"
     OUTPUT_OUTLET  = "OUTPUT_OUTLET"
@@ -803,10 +802,6 @@ class AutoCatchmentAlgorithm(QgsProcessingAlgorithm):
             self.tr("Include river network  (MERIT method only)"),
             defaultValue=False, optional=True))
         self.addParameter(QgsProcessingParameterBoolean(
-            self.FORCE_REPROCESS,
-            self.tr("Force re-run stream pipeline  (ignore cached rasters)"),
-            defaultValue=False, optional=True))
-        self.addParameter(QgsProcessingParameterBoolean(
             self.USE_CACHED_DEM,
             self.tr("Use cached DEM  (skip re-download in auto mode)"),
             defaultValue=True, optional=True))
@@ -840,7 +835,6 @@ class AutoCatchmentAlgorithm(QgsProcessingAlgorithm):
         pt_wgs = self.parameterAsPoint(parameters, self.CLICK_POINT, context, wgs84)
         lon, lat = pt_wgs.x(), pt_wgs.y()
 
-        force_reprocess = self.parameterAsBoolean(parameters, self.FORCE_REPROCESS, context)
         use_cached_dem  = self.parameterAsBoolean(parameters, self.USE_CACHED_DEM, context)
         script_dir = os.path.dirname(os.path.abspath(__file__))
         temp_dir   = os.path.join(os.environ.get("TEMP", "C:\\Temp"), "wbt_streams")
@@ -890,8 +884,7 @@ class AutoCatchmentAlgorithm(QgsProcessingAlgorithm):
         # ── Delineate (with tile-expansion loop in download mode) ───────────────
         if not download_mode:
             watershed_v, snapped_v = _delineate(
-                wbt, dem_path, coords, snap_dist, threshold_km2, epsg_int, temp_dir, feedback,
-                force_reprocess=force_reprocess)
+                wbt, dem_path, coords, snap_dist, threshold_km2, epsg_int, temp_dir, feedback)
         else:
             # integer 1°×1° coverage bounds (inclusive SW corner of each tile)
             w_t = e_t = int(math.floor(lon))
@@ -953,7 +946,7 @@ class AutoCatchmentAlgorithm(QgsProcessingAlgorithm):
 
                 watershed_v, snapped_v = _delineate(
                     wbt, mosaic_path, coords, snap_dist, threshold_km2,
-                    epsg_int, temp_dir, feedback, force_reprocess=force_reprocess)
+                    epsg_int, temp_dir, feedback)
 
                 grew = self._expand_if_touching(
                     watershed_v, target_crs, context, feedback,
