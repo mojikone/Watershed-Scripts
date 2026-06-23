@@ -443,6 +443,8 @@ def _apply_merit_patches():
         megabasin = str(home_unit_catchment)[0:2]
         from delineator.data import _find_data_file
         rivers_db_path = _find_data_file(f"vector/rivers{megabasin}.db", config)
+        if rivers_db_path is None:
+            return 0
         conn = _sl3.connect(rivers_db_path)
         cur = conn.cursor()
         cur.execute(f"SELECT uparea FROM rivers WHERE comid = {home_unit_catchment}")
@@ -619,11 +621,10 @@ def _delineate_merit(lat, lng, include_rivers, data_dir, feedback):
 
     files_needed = [
         f"vector/basins{megabasin}.db",
+        f"vector/rivers{megabasin}.db",
         f"raster/flowdir{megabasin}.tif",
         f"raster/accum{megabasin}.tif",
     ]
-    if include_rivers:
-        files_needed.append(f"vector/rivers{megabasin}.db")
 
     requests = _ensure_requests(feedback)
     for rel_path in files_needed:
