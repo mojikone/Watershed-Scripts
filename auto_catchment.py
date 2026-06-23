@@ -337,9 +337,9 @@ def _init_wbt(feedback):
     return wbt
 
 
-def _delineate(wbt, dem_path, coords, snap_dist, threshold_km2, epsg, temp_dir, feedback):
+def _delineate(wbt, dem_path, coords, snap_dist, threshold_km2, epsg, temp_dir, feedback, force_reprocess=False):
     """Full WhiteboxTools watershed pipeline (mirrors delineate_catchments.py).
-    Returns (watershed_vector_shp, snapped_outlets_shp). Caches by DEM mtime."""
+    Returns (watershed_vector_shp, snapped_outlets_shp). Stream rasters are always rebuilt."""
     from osgeo import gdal
     gdal.UseExceptions()
 
@@ -375,14 +375,6 @@ def _delineate(wbt, dem_path, coords, snap_dist, threshold_km2, epsg, temp_dir, 
     pour_r      = os.path.join(temp_dir, "pour_raster.tif")
     watershed_r = os.path.join(temp_dir, "watershed.tif")
     watershed_v = os.path.join(temp_dir, "watershed_vec.shp")
-    dem_stamp   = os.path.join(temp_dir, "dem_source.txt")
-
-    # Invalidate pipeline cache when the converted DEM changes
-    dem_sig = f"{dem_use}|{os.path.getmtime(dem_use):.0f}"
-    prev = open(dem_stamp).read().strip() if os.path.exists(dem_stamp) else ""
-    rebuild = (prev != dem_sig)
-    if rebuild:
-        feedback.pushInfo("DEM changed — (re)building stream rasters.")
 
     def _step(label, fn, prog):
         if feedback.isCanceled():
@@ -402,37 +394,30 @@ def _delineate(wbt, dem_path, coords, snap_dist, threshold_km2, epsg, temp_dir, 
     _step("Prepare pour point(s) → vector",
           lambda: wbt.csv_points_to_vector(pour_csv, pour_v, xfield=0, yfield=1, epsg=epsg), 4)
 
-    # Stream pipeline (cached unless DEM changed)
-    need = rebuild or not all(os.path.exists(f) for f in [filled, flowdir, streams_r])
-    if need:
-        src_tmp = gdal.Open(dem_use)
-        dem_cells = src_tmp.RasterXSize * src_tmp.RasterYSize
-        src_tmp = None
-        dem_gb_est = dem_cells * 4 * 5 / 2**30
-        total_ram, avail_ram = _get_ram_gb()
-        fill_method = (
-            "breach_lc"
-            if avail_ram >= dem_gb_est * 1.5 and total_ram >= 16
-            else "fill_wang_liu"
-        )
-        if fill_method == "breach_lc":
-            _step("[1/4] Breach depressions (least-cost, accurate)",
-                  lambda: wbt.breach_depressions_least_cost(dem_use, filled,
-                                                            dist=5, fill=True), 10)
-        else:
-            _step("[1/4] Fill depressions — Wang & Liu (memory-efficient)",
-                  lambda: wbt.fill_depressions_wang_and_liu(dem_use, filled), 10)
-        _step("[2/4] D8 flow direction",
-              lambda: wbt.d8_pointer(filled, flowdir), 24)
-        _step("[3/4] D8 flow accumulation",
-              lambda: wbt.d8_flow_accumulation(filled, flowacc, out_type="cells"), 34)
-        _step(f"[4/4] Extract streams ({threshold_cells:,} cells = {threshold_km2} km²)",
-              lambda: wbt.extract_streams(flowacc, streams_r, threshold=threshold_cells), 42)
-        with open(dem_stamp, "w") as f:
-            f.write(dem_sig)
+    # Stream pipeline — always rebuilt to guarantee correctness (no stale-cache risk)
+    src_tmp = gdal.Open(dem_use)
+    dem_cells = src_tmp.RasterXSize * src_tmp.RasterYSize
+    src_tmp = None
+    dem_gb_est = dem_cells * 4 * 5 / 2**30
+    total_ram, avail_ram = _get_ram_gb()
+    fill_method = (
+        "breach_lc"
+        if avail_ram >= dem_gb_est * 1.5 and total_ram >= 16
+        else "fill_wang_liu"
+    )
+    if fill_method == "breach_lc":
+        _step("[1/4] Breach depressions (least-cost, accurate)",
+              lambda: wbt.breach_depressions_least_cost(dem_use, filled,
+                                                        dist=5, fill=True), 10)
     else:
-        feedback.pushInfo("  Reusing cached fill / flowdir / streams.")
-        feedback.setProgress(42)
+        _step("[1/4] Fill depressions — Wang & Liu (memory-efficient)",
+              lambda: wbt.fill_depressions_wang_and_liu(dem_use, filled), 10)
+    _step("[2/4] D8 flow direction",
+          lambda: wbt.d8_pointer(filled, flowdir), 24)
+    _step("[3/4] D8 flow accumulation",
+          lambda: wbt.d8_flow_accumulation(filled, flowacc, out_type="cells"), 34)
+    _step(f"[4/4] Extract streams ({threshold_cells:,} cells = {threshold_km2} km²)",
+          lambda: wbt.extract_streams(flowacc, streams_r, threshold=threshold_cells), 42)
 
     # Delineation
     _step(f"Snap pour point(s) to stream (tol {snap_dist} m)",
@@ -719,7 +704,8 @@ class AutoCatchmentAlgorithm(QgsProcessingAlgorithm):
     THRESHOLD_KM2  = "THRESHOLD_KM2"
     TARGET_CRS     = "TARGET_CRS"
     MAX_TILES      = "MAX_TILES"
-    INCLUDE_RIVERS = "INCLUDE_RIVERS"
+    INCLUDE_RIVERS  = "INCLUDE_RIVERS"
+    FORCE_REPROCESS = "FORCE_REPROCESS"
     OUTPUT         = "OUTPUT"
     OUTPUT_OUTLET  = "OUTPUT_OUTLET"
     OUTPUT_DEM     = "OUTPUT_DEM"
@@ -815,6 +801,10 @@ class AutoCatchmentAlgorithm(QgsProcessingAlgorithm):
             self.INCLUDE_RIVERS,
             self.tr("Include river network  (MERIT method only)"),
             defaultValue=False, optional=True))
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.FORCE_REPROCESS,
+            self.tr("Force re-run stream pipeline  (ignore cached rasters)"),
+            defaultValue=False, optional=True))
         self.addParameter(QgsProcessingParameterVectorDestination(
             self.OUTPUT, self.tr("Output catchment polygons"),
             type=QgsProcessing.TypeVectorPolygon))
@@ -845,9 +835,10 @@ class AutoCatchmentAlgorithm(QgsProcessingAlgorithm):
         pt_wgs = self.parameterAsPoint(parameters, self.CLICK_POINT, context, wgs84)
         lon, lat = pt_wgs.x(), pt_wgs.y()
 
+        force_reprocess = self.parameterAsBoolean(parameters, self.FORCE_REPROCESS, context)
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        temp_dir   = os.path.join(os.environ.get("TEMP", "C:\\Temp"), "auto_catchment")
-        tile_dir   = os.path.join(temp_dir, "cop_tiles")
+        temp_dir   = os.path.join(os.environ.get("TEMP", "C:\\Temp"), "wbt_streams")
+        tile_dir   = os.path.join(os.environ.get("TEMP", "C:\\Temp"), "auto_catchment", "cop_tiles")
         os.makedirs(temp_dir, exist_ok=True)
         os.makedirs(tile_dir, exist_ok=True)
 
@@ -893,12 +884,15 @@ class AutoCatchmentAlgorithm(QgsProcessingAlgorithm):
         # ── Delineate (with tile-expansion loop in download mode) ───────────────
         if not download_mode:
             watershed_v, snapped_v = _delineate(
-                wbt, dem_path, coords, snap_dist, threshold_km2, epsg_int, temp_dir, feedback)
+                wbt, dem_path, coords, snap_dist, threshold_km2, epsg_int, temp_dir, feedback,
+                force_reprocess=force_reprocess)
         else:
             # integer 1°×1° coverage bounds (inclusive SW corner of each tile)
             w_t = e_t = int(math.floor(lon))
             s_t = n_t = int(math.floor(lat))
-            mosaic_path = out_dem_path or os.path.join(temp_dir, "auto_dem.tif")
+            _dl_dir = os.path.join(os.environ.get("TEMP", "C:\\Temp"), "auto_catchment")
+            os.makedirs(_dl_dir, exist_ok=True)
+            mosaic_path = out_dem_path or os.path.join(_dl_dir, "auto_dem.tif")
 
             is_copernicus = source_idx in (0, 1)
             cop_res       = 90 if source_idx == 1 else 30
@@ -931,7 +925,7 @@ class AutoCatchmentAlgorithm(QgsProcessingAlgorithm):
                         raise QgsProcessingException(
                             f"Reached {max_tiles} expansion iterations. "
                             "Raise 'Max tiles / expansions' if the catchment is larger.")
-                    ot_raw = os.path.join(temp_dir, f"ot_raw_{it}.tif")
+                    ot_raw = os.path.join(_dl_dir, f"ot_raw_{it}.tif")
                     _download_opentopography(
                         west=float(w_t), south=float(s_t),
                         east=float(e_t + 1), north=float(n_t + 1),
@@ -941,7 +935,7 @@ class AutoCatchmentAlgorithm(QgsProcessingAlgorithm):
 
                 watershed_v, snapped_v = _delineate(
                     wbt, mosaic_path, coords, snap_dist, threshold_km2,
-                    epsg_int, temp_dir, feedback)
+                    epsg_int, temp_dir, feedback, force_reprocess=force_reprocess)
 
                 grew = self._expand_if_touching(
                     watershed_v, target_crs, context, feedback,
