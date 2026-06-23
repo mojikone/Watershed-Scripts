@@ -706,6 +706,7 @@ class AutoCatchmentAlgorithm(QgsProcessingAlgorithm):
     MAX_TILES      = "MAX_TILES"
     INCLUDE_RIVERS  = "INCLUDE_RIVERS"
     FORCE_REPROCESS = "FORCE_REPROCESS"
+    USE_CACHED_DEM  = "USE_CACHED_DEM"
     OUTPUT         = "OUTPUT"
     OUTPUT_OUTLET  = "OUTPUT_OUTLET"
     OUTPUT_DEM     = "OUTPUT_DEM"
@@ -805,6 +806,10 @@ class AutoCatchmentAlgorithm(QgsProcessingAlgorithm):
             self.FORCE_REPROCESS,
             self.tr("Force re-run stream pipeline  (ignore cached rasters)"),
             defaultValue=False, optional=True))
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.USE_CACHED_DEM,
+            self.tr("Use cached DEM  (skip re-download in auto mode)"),
+            defaultValue=True, optional=True))
         self.addParameter(QgsProcessingParameterVectorDestination(
             self.OUTPUT, self.tr("Output catchment polygons"),
             type=QgsProcessing.TypeVectorPolygon))
@@ -836,6 +841,7 @@ class AutoCatchmentAlgorithm(QgsProcessingAlgorithm):
         lon, lat = pt_wgs.x(), pt_wgs.y()
 
         force_reprocess = self.parameterAsBoolean(parameters, self.FORCE_REPROCESS, context)
+        use_cached_dem  = self.parameterAsBoolean(parameters, self.USE_CACHED_DEM, context)
         script_dir = os.path.dirname(os.path.abspath(__file__))
         temp_dir   = os.path.join(os.environ.get("TEMP", "C:\\Temp"), "wbt_streams")
         tile_dir   = os.path.join(os.environ.get("TEMP", "C:\\Temp"), "auto_catchment", "cop_tiles")
@@ -907,31 +913,43 @@ class AutoCatchmentAlgorithm(QgsProcessingAlgorithm):
                                   f"({n_cells} tile(s))")
                 feedback.pushInfo("═" * 60)
 
+                # On the first iteration, optionally reuse a cached mosaic DEM
+                skip_download = (use_cached_dem and it == 1
+                                 and os.path.exists(mosaic_path))
+
                 if is_copernicus:
                     if n_cells > max_tiles:
                         raise QgsProcessingException(
                             f"Catchment needs {n_cells} tiles, exceeding the cap of "
                             f"{max_tiles}. Raise 'Max tiles / expansions' if expected.")
-                    cells = [(la, lo) for la in range(s_t, n_t + 1)
-                                       for lo in range(w_t, e_t + 1)]
-                    tiles = _download_copernicus_tiles(cells, tile_dir, feedback, cop_res)
-                    if not tiles:
-                        raise QgsProcessingException(
-                            "No Copernicus tiles downloaded — check internet connection "
-                            "and that the point is over land within Copernicus coverage.")
-                    _mosaic_warp(tiles, target_crs.authid(), mosaic_path, feedback)
+                    if skip_download:
+                        feedback.pushInfo(
+                            f"  Using cached DEM: {mosaic_path}")
+                    else:
+                        cells = [(la, lo) for la in range(s_t, n_t + 1)
+                                           for lo in range(w_t, e_t + 1)]
+                        tiles = _download_copernicus_tiles(cells, tile_dir, feedback, cop_res)
+                        if not tiles:
+                            raise QgsProcessingException(
+                                "No Copernicus tiles downloaded — check internet connection "
+                                "and that the point is over land within Copernicus coverage.")
+                        _mosaic_warp(tiles, target_crs.authid(), mosaic_path, feedback)
                 else:
                     if it > max_tiles:
                         raise QgsProcessingException(
                             f"Reached {max_tiles} expansion iterations. "
                             "Raise 'Max tiles / expansions' if the catchment is larger.")
                     ot_raw = os.path.join(_dl_dir, f"ot_raw_{it}.tif")
-                    _download_opentopography(
-                        west=float(w_t), south=float(s_t),
-                        east=float(e_t + 1), north=float(n_t + 1),
-                        demtype=ot_demtype, api_key=ot_key,
-                        out_path=ot_raw, feedback=feedback)
-                    _mosaic_warp([ot_raw], target_crs.authid(), mosaic_path, feedback)
+                    if skip_download:
+                        feedback.pushInfo(
+                            f"  Using cached DEM: {mosaic_path}")
+                    else:
+                        _download_opentopography(
+                            west=float(w_t), south=float(s_t),
+                            east=float(e_t + 1), north=float(n_t + 1),
+                            demtype=ot_demtype, api_key=ot_key,
+                            out_path=ot_raw, feedback=feedback)
+                        _mosaic_warp([ot_raw], target_crs.authid(), mosaic_path, feedback)
 
                 watershed_v, snapped_v = _delineate(
                     wbt, mosaic_path, coords, snap_dist, threshold_km2,
