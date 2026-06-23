@@ -97,6 +97,29 @@ def _pip_install(package, feedback=None):
 # Shared helpers (ported verbatim in spirit from download_dem.py / delineate_*.py)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _get_ram_gb():
+    try:
+        import ctypes
+        class _MEM(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("sullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        m = _MEM()
+        m.dwLength = ctypes.sizeof(_MEM)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+        return m.ullTotalPhys / 2**30, m.ullAvailPhys / 2**30
+    except Exception:
+        pass
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        return vm.total / 2**30, vm.available / 2**30
+    except Exception:
+        return 8.0, 4.0
+
+
 def _ensure_requests(feedback=None):
     if WBT_SITE not in sys.path:
         sys.path.insert(0, WBT_SITE)
@@ -382,8 +405,23 @@ def _delineate(wbt, dem_path, coords, snap_dist, threshold_km2, epsg, temp_dir, 
     # Stream pipeline (cached unless DEM changed)
     need = rebuild or not all(os.path.exists(f) for f in [filled, flowdir, streams_r])
     if need:
-        _step("[1/4] Fill depressions (Wang & Liu)",
-              lambda: wbt.fill_depressions_wang_and_liu(dem_use, filled), 10)
+        src_tmp = gdal.Open(dem_use)
+        dem_cells = src_tmp.RasterXSize * src_tmp.RasterYSize
+        src_tmp = None
+        dem_gb_est = dem_cells * 4 * 5 / 2**30
+        total_ram, avail_ram = _get_ram_gb()
+        fill_method = (
+            "breach_lc"
+            if avail_ram >= dem_gb_est * 1.5 and total_ram >= 16
+            else "fill_wang_liu"
+        )
+        if fill_method == "breach_lc":
+            _step("[1/4] Breach depressions (least-cost, accurate)",
+                  lambda: wbt.breach_depressions_least_cost(dem_use, filled,
+                                                            dist=5, fill=True), 10)
+        else:
+            _step("[1/4] Fill depressions — Wang & Liu (memory-efficient)",
+                  lambda: wbt.fill_depressions_wang_and_liu(dem_use, filled), 10)
         _step("[2/4] D8 flow direction",
               lambda: wbt.d8_pointer(filled, flowdir), 24)
         _step("[3/4] D8 flow accumulation",
