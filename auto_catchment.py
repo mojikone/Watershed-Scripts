@@ -372,7 +372,6 @@ def _delineate(wbt, dem_path, coords, snap_dist, threshold_km2, epsg, temp_dir, 
     pour_csv    = os.path.join(temp_dir, "pour.csv")
     pour_v      = os.path.join(temp_dir, "pour.shp")
     snapped_v   = os.path.join(temp_dir, "pour_snapped.shp")
-    pour_r      = os.path.join(temp_dir, "pour_raster.tif")
     watershed_r = os.path.join(temp_dir, "watershed.tif")
     watershed_v = os.path.join(temp_dir, "watershed_vec.shp")
 
@@ -426,11 +425,11 @@ def _delineate(wbt, dem_path, coords, snap_dist, threshold_km2, epsg, temp_dir, 
         raise QgsProcessingException(
             "Snapping failed — no snapped point produced. Increase snap distance "
             "or check the point lies within the DEM and near a stream.")
-    _step("Rasterize snapped pour point(s)",
-          lambda: wbt.vector_points_to_raster(snapped_v, pour_r, field="CAT_ID",
-                                              nodata=True, cell_size=None, base=filled), 64)
+    # Snapped shapefile goes straight to Watershed: WBT hard-codes -32768 as
+    # the pour-raster NoData, so a raster built on base=filled (NoData 3.4e38)
+    # turns every cell into an outlet. IDs = record order + 1 = CAT_ID.
     _step("Delineate watershed(s)",
-          lambda: wbt.watershed(flowdir, pour_r, watershed_r), 76)
+          lambda: wbt.watershed(flowdir, snapped_v, watershed_r), 70)
 
     feedback.pushInfo("Vectorise catchment polygon(s) ...")
     feedback.setProgress(84)

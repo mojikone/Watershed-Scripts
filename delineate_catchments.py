@@ -359,7 +359,6 @@ class DelineateCatchmentsAlgorithm(QgsProcessingAlgorithm):
         pour_csv    = os.path.join(temp_dir, "pour.csv")
         pour_v      = os.path.join(temp_dir, "pour.shp")
         snapped_v   = os.path.join(temp_dir, "pour_snapped.shp")
-        pour_r      = os.path.join(temp_dir, "pour_raster.tif")
         watershed_r = os.path.join(temp_dir, "watershed.tif")
         watershed_v = os.path.join(temp_dir, "watershed_vec.shp")
         dem_stamp   = os.path.join(temp_dir, "dem_source.txt")
@@ -488,7 +487,7 @@ class DelineateCatchmentsAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo("  Catchment delineation")
         feedback.pushInfo("─" * 54)
 
-        _step(f"[1/4] Snap pour points to stream  (tolerance {snap_dist} m)",
+        _step(f"[1/3] Snap pour points to stream  (tolerance {snap_dist} m)",
               lambda: wbt.jenson_snap_pour_points(pour_v, streams_r, snapped_v,
                                                    snap_dist=snap_dist), 50)
 
@@ -499,15 +498,16 @@ class DelineateCatchmentsAlgorithm(QgsProcessingAlgorithm):
                 f"{snap_dist} m of a stream."
             )
 
-        _step("[2/4] Rasterize snapped pour points",
-              lambda: wbt.vector_points_to_raster(snapped_v, pour_r,
-                                                   field="CAT_ID", nodata=True,
-                                                   cell_size=None, base=filled), 62)
+        # Pour points go to WBT as the snapped shapefile, not a raster: WBT's
+        # Watershed hard-codes -32768 as the pour-raster NoData, so a raster
+        # built on base=filled (NoData 3.4e38) turns every cell into an outlet
+        # (one-cell catchment + whole-extent polygon with VALUE 2147483647).
+        # Watershed IDs = record order + 1 = CAT_ID (CSV written in order,
+        # JensonSnapPourPoints keeps every record in order).
+        _step("[2/3] Delineate watersheds",
+              lambda: wbt.watershed(flowdir, snapped_v, watershed_r), 66)
 
-        _step("[3/4] Delineate watersheds",
-              lambda: wbt.watershed(flowdir, pour_r, watershed_r), 74)
-
-        feedback.pushInfo("[4/4] Vectorise catchment polygons ...")
+        feedback.pushInfo("[3/3] Vectorise catchment polygons ...")
         feedback.setProgress(82)
         t = time.time()
         for f in glob.glob(watershed_v.replace(".shp", ".*")):
